@@ -762,7 +762,7 @@ Debounce: How often zoom inputs are received. Helps keep zooming smooth.
 
         if self.pil_image.n_frames:
             framecount = self.pil_image.n_frames
-            if framecount >= 1:
+            if framecount > 1:
                 self.open_thread = threading.Thread(target=self._preload_frames, args=(filename,), daemon=True)
                 self.open_thread.start()
                 self.secondary(self.frames)
