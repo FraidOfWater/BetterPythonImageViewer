@@ -2,7 +2,30 @@
 
 ![PythonImageViewer](https://user-images.githubusercontent.com/29155364/106603190-7449bd00-650a-11eb-80f1-b3fe96ba88bf.gif)
 
-Using module : tkinter, Pilow, math, numpy, os
+Using modules : 
+
+import tkinter as tk
+
+from tkinter import filedialog
+
+from PIL import Image, ImageTk
+
+import numpy as np
+
+import math
+
+import os
+
+import json
+
+import psutil
+
+import threading
+
+from collections import OrderedDict
+
+from time import perf_counter
+
 
 |        |                                |
 | ------ | ------------------------------ |
