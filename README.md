@@ -5,41 +5,37 @@ Credit to ImagingSolutions https://github.com/ImagingSolution/PythonImageViewer 
 
 ![PythonImageViewer](https://user-images.githubusercontent.com/29155364/106603190-7449bd00-650a-11eb-80f1-b3fe96ba88bf.gif)
 
-# Whats new #
-Supports gifs, webp as well as common picture types.
-Added: Performance, animation support, options.
+# Changes #
+Support webp, gif, mp4, webm.
+Support thumbnail capability
+Use an antialiasing techinique so unzoomed images dont look bad.
+Use caching
 
-Uses "Quick zoom & Panning", essentially much better performance, as we render in NEAREST while on the move, panning or zooming, rendering full quality only when we stop.
-Added a "debouncer", a lag-killing mechanism, which allows zooming in and out of large pictures without stalling. Recommended debounce value is 28 (ms), the default.
-Tried to also make it as adaptable as possible, so it can be used in python applications. It by default works as a standalone and creates its own prefs file for keeping the settings.
+Without antialiasing, use Nearest as filter.
 
 ![python_QUHpf6geqw](https://github.com/user-attachments/assets/e7a61b4e-b34d-4b1d-97df-d4a9740f7427) ![VZEMetR8YX](https://github.com/user-attachments/assets/3f54a56e-0ef8-4395-b345-cf2b4ed7636a)
 
+requires:
+psutil
+pillow
+natsort
+send2trash
+ultralytics
+torch
+torchvision
+scikit-image
+numpy
+imageio
+pymediainfo
+av
+pyvips
+python-vlc
 
-Using modules : 
+manual:
+vlc (either you need the plugins folder and libvlc.dll, libvlccore.dll) or you can just install the 64-bit version via installer.
+pyvips (download the windwos binaries from https://github.com/libvips/libvips/releases. 64-bit web build should be enough)
 
-import tkinter as tk
-
-from tkinter import filedialog
-
-from PIL import Image, ImageTk
-
-import numpy as np
-
-import math
-
-import os
-
-import json
-
-import psutil
-
-import threading
-
-from collections import OrderedDict
-
-from time import perf_counter
-
+pyvips can be acquired from https://github.com/libvips/libvips/releases and downloading windows binaries, and vlc can be 
 
 |        |                                |
 | ------ | ------------------------------ |
