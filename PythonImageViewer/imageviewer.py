@@ -1,24 +1,55 @@
-import vlc, tkinter as tk, numpy as np, math, os, json
+import vlc, tkinter as tk, numpy as np, math, os, json, queue
 from time import perf_counter
 from PIL import Image, ImageTk
 from collections import OrderedDict
-from threading import Thread, Event, Lock
+from threading import Thread, Lock, Event
 from tkinter import ttk
+#from sorter import ImageViewer
 Image.MAX_IMAGE_PIXELS = 346724322
-
-def import_pyvips():
-    "This looks scary, but it just points to where 'import pyvips' can find it's files from"
-    "To update this module, change vips-dev-8.16 to your new folder name here and in build.bat"
-    base_path = os.path.dirname(os.path.abspath(__file__))
-    vipsbin = os.path.join(base_path, "vips-dev-8.16", "bin")
-    
-    if not os.path.exists(vipsbin):
-        raise FileNotFoundError(f"The directory {vipsbin} does not exist.")
-
-    os.environ['PATH'] = os.pathsep.join((vipsbin, os.environ['PATH']))
-    os.add_dll_directory(vipsbin)
-import_pyvips()
+# sorter "e" can sort to the most recently assigned to e's. well it can show those folders first!
+vipsbin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vips-dev-8.17", "bin")
+os.environ['PATH'] = os.pathsep.join((vipsbin, os.environ['PATH']))
+os.add_dll_directory(vipsbin)
 import pyvips
+
+
+class AsyncImageLoader:
+    def __init__(self, viewer):
+        self.viewer = viewer
+        self.queue = queue.Queue()
+        self.thread = Thread(target=self._worker, name="(Thread) Viewer Asynch Tasks", daemon=True)
+        self.stop_flag = False
+        self.thread.start()  # Only one thread ever
+
+    def _worker(self):
+        while not self.stop_flag:
+            try:
+                path, obj, token = self.queue.get(timeout=0.1)
+                # Skip any older queued requests
+                while not self.queue.empty():
+                    path, obj, token = self.queue.get_nowait()
+                
+                if token != self.viewer.current_load_token or not path:
+                    continue
+
+                img = self.viewer._load_full_image_in_background(path, obj)
+
+                # hand off to main thread
+                self.viewer.master.after(0, lambda p=path, i=img, t=token: self.viewer._on_async_image_ready(p, i, t))
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print("Async loader error:", e)
+
+    def request_load(self, path, obj):
+        token = object()
+        self.viewer.current_load_token = token
+        self.queue.put((path, obj, token))
+
+    def stop(self):
+        self.stop_flag = True
+        self.queue.put((None, None, None))
 
 from collections import OrderedDict
 class LRUCache(OrderedDict):
@@ -369,91 +400,37 @@ class Application(tk.Frame):
         def pack(self, **kw):
             self.app.canvas.pack_forget()
             self.app.vlc_frame.pack(expand=True, fill=tk.BOTH)
+            self.app.vlc_frame.bind("<Configure>", self.app.window_resize)
             self.app.master.update()
 
         def destroy(self, threaded=True):
-            import time
-            def stop_player(player):
-                try:
-                    player.stop()
-                    for _ in range(10):  # up to 1 second
-                        if not player.is_playing():
-                            break
-                        time.sleep(0.1)
-                except Exception as e:
-                    print("destroying error:", e)
-                try:
-                    player.release()
-                except Exception as e:
-                    print("destroying error:", e)
-                try:
-                    try:
-                        self.player.set_hwnd(0)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print("error clearing hwnd:", e)
-                try:
-                    if getattr(self, "events", None):
-                        try:
-                            self.events.event_detach(vlc.EventType.MediaPlayerPlaying)
-                        except Exception:
-                            pass
-                        try:
-                            self.events.event_detach(vlc.EventType.MediaPlayerEndReached)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print("error detaching events:", e)
-                try:
-                    if getattr(self, "media_list_player", None):
-                        try:
-                            self.media_list_player.stop()
-                        except Exception:
-                            pass
-                        try:
-                            self.media_list_player.release()
-                        except Exception:
-                            pass
-                        self.media_list_player = None
-                except Exception:
-                    pass
-                try:
-                    if getattr(self, "media", None):
-                        try:
-                            self.media.release()
-                        except Exception:
-                            pass
-                        self.media = None
-                except Exception:
-                    pass
+            #self.player.set_hwnd(0)
+            self.player.stop()
+            #self.player.release()
+            if getattr(self, "events", None):
+                self.events.event_detach(vlc.EventType.MediaPlayerPlaying)
+                self.events.event_detach(vlc.EventType.MediaPlayerEndReached)
 
-                try:
-                    if getattr(self, "media_list", None):
-                        try:
-                            self.media_list.release()
-                        except Exception:
-                            pass
-                        self.media_list = None
-                except Exception:
-                    pass
+            if getattr(self, "media_list_player", None):
+                self.media_list_player.stop()
+                self.media_list_player.release()
+                self.media_list_player = None
 
-                self.events = None
+            if getattr(self, "media", None):
+                self.media = None
 
-            try:
-                if hasattr(self, "player") and self.player:
-                    stop_player(self.player)
-            except Exception as e:
-                print("Error stopping player:", e)
 
-            try:
-                if self.video_frame:
-                    self.video_frame.grid_forget()
-                    self.video_frame.destroy()
-                if self.canvas:
-                    self.canvas.destroy()
-            except Exception as e:
-                print("Error destroying widgets:", e)
+            if getattr(self, "media_list", None):
+                self.media_list.release()
+                self.media_list = None
+
+            self.events = None
+
+            if self.video_frame:
+                self.video_frame.grid_forget()
+                self.video_frame.destroy()
+            if self.canvas:
+                self.canvas.destroy()
 
             self.player = None
             self.media_list_player = None
@@ -488,8 +465,7 @@ class Application(tk.Frame):
     
     def __init__(self, master=None, 
                  geometry: str=None, lastdir: str=None, 
-                 zoom_magnitude: float=None, rotation_degrees: int=None, 
-                 auto_fit_var: bool=None, unbound_var: bool=None, 
+                 zoom_magnitude: float=None, rotation_degrees: int=None, unbound_var: bool=None, 
                  disable_menubar: bool=None, statusbar: bool=None, 
                  initial_filter: Image.Resampling=None, drag_quality: Image.Resampling=None, anti_aliasing: bool=None, thumbnail_var: str=None,
                  filter_delay: int=None, show_advanced: bool=None, 
@@ -498,6 +474,9 @@ class Application(tk.Frame):
                  button_color=None, active_button_color=None, 
                  statusbar_color=None, volume=None, savedata={}, gui=None):
         
+        self.current_load_token = None
+        self.loader = AsyncImageLoader(self)
+        self.draw_queue = []
         self.undo = []
         self.debug = []
         self.filename = None
@@ -505,6 +484,7 @@ class Application(tk.Frame):
         self.timer.start()
         self.gui = gui
         self.savedata = savedata
+        self.f = True
 
         self.save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer_prefs.json")
         if not savedata: 
@@ -515,15 +495,16 @@ class Application(tk.Frame):
 
         self.standalone = True if master == None else False
         self.title = "Python Media Viewer"
+        self.a = False
         if self.standalone:
             if gui:
                 master = tk.Toplevel()
             else:
                 master = tk.Tk()
                 master.bind('<KeyPress-Left>', lambda e: self.key_press(-1))
-                master.bind('<KeyPress-Down>', lambda e: self.key_press(-1))
+                #master.bind('<KeyPress-Down>', lambda e: self.key_press(-1))
                 master.bind('<KeyPress-Right>', lambda e: self.key_press(1))
-                master.bind('<KeyPress-Up>', lambda e: self.key_press(1))
+                #master.bind('<KeyPress-Up>', lambda e: self.key_press(1))
                 master.bind('<F2>', lambda e: self.rename())
                 master.bind('<Delete>', lambda e: self.trash())
                 master.bind('<Control-z>', lambda e: self.on_ctrl_z())
@@ -536,7 +517,6 @@ class Application(tk.Frame):
             self.zoom_magnitude = zoom_magnitude or float(savedata.get("zoom_magnitude", 1.25))
             self.rotation_degrees = rotation_degrees or int(savedata.get("rotation_degrees", -5))
 
-            self.auto_fit_var = tk.BooleanVar(value=auto_fit_var or savedata.get("auto_fit_on_resize", True))
             self.unbound_var = tk.BooleanVar(value=unbound_var or savedata.get("unbound_pan", False))
 
             self.disable_menubar = disable_menubar or savedata.get("disable_menubar", False)
@@ -570,7 +550,7 @@ class Application(tk.Frame):
                     "text": "#000000"
                     }
                 )
-            
+        self.bg_color = tuple(int(self.colors["canvas"][i:i+2], 16) for i in (1, 3, 5)) + (0,)
         super().__init__(master, bg=self.colors["canvas"])
         self.master = master
 
@@ -588,13 +568,14 @@ class Application(tk.Frame):
         self.save = None
         self.save1 = None
         self.memory_after_id = None
-        self._secondary_after_id = None
         self.gif_after_id = None
+        self.gif_gen_after_id = None
+        self.draw_img_id = None
         
         self._zoom_cache = LRUCache(maxsize=32, name="zoom") # saved zoom levels
         self._imagetk_cache = LRUCache(maxsize=0, name="imagetk") # saved gif imagetks.
 
-        self.vlc_instance = vlc.Instance("--quiet")
+        self.vlc_instance = vlc.Instance()
         self.vlc_frame = None
         self.old = None
 
@@ -616,160 +597,50 @@ class Application(tk.Frame):
         self.reset_transform()
         self.create_widgets()
     
-    def ask_prefilled_text(self, parent, title, message, default_text=""):
-        dialog = PrefilledInputDialog(parent, title, message, default_text)
-        return dialog.result
-
-    def rename(self, event=None):
-        if not self.filename: return
-        title = "Rename Image"
-        label = ""
-        path = self.filename
-        old_name = os.path.basename(path)
-
-        while True:
-            new_name = self.ask_prefilled_text(
-            self, title, label, default_text=old_name)
-            if new_name:
-                new_path = os.path.join(os.path.dirname(path), new_name)
-                try:
-                    os.rename(path, new_path)
-                    self.set_image(new_path)
-                    break
-                except Exception as e:
-                    print("Rename errors:", e)
-                    label = f"{new_name} already exists in {os.path.basename(os.path.dirname(path))}"
-                    old_name = new_name
-            else:
-                break
-    
-    def trash(self, event=None):
-        if not self.filename or not self.filenames: return
-        path = self.filenames.pop(self.filename_index)
-        self.undo.append((path, self.filename_index))
-        if not self.filenames: self.set_image(None) # doesnt exist, display none
-        elif self.filename_index >= len(self.filenames): # index is over, diosplay latest
-            self.set_image(self.filenames[-1])
-            self.filename_index = len(self.filenames)-1
-        else:
-            self.set_image(self.filenames[self.filename_index]) # index exists
-
-    
-    def on_ctrl_z(self, event=None):
-        if not self.undo: return
-        path, index = self.undo.pop()
-        self.set_image(path)
-        self.filenames.insert(index, path)
-
-    # Window
-    def window_resize(self, event):
-        if not self.auto_fit_var.get():
-            return
-        if (event.widget is self.canvas or event.widget is self.master) and self.pil_image:
-            self.zoom_fit()
-            self.dragging = True
-            self.draw_image(self.pil_image, drag=True, latest=True)
-            if self.save1:
-                self.after_cancel(self.save1)
-            self.save1 = self.after(self.filter_delay.get(), lambda: self.after_idle(lambda: (self._imagetk_cache.clear(), self._zoom_cache.clear(), self.draw_image(self.pil_image), setattr(self, "dragging", False))))
-        elif event.widget is self.master and self.vlc_frame:
-            vlc_player = self.old  # or however you store the instance
-            if vlc_player and vlc_player.video_frame:
-                w = event.width
-                h = event.height
-
-                if self.statusbar.get():
-                    h -= 25
-
-                # Resize the containing frames
-                vlc_player.video_container.config(width=w, height=h)
-                
-                vlc_player.video_frame.config(width=w, height=h - 35)  # leave space for controls
-                vlc_player.controls_frame.config(width=w)
-
-    def close_vlc(self):
-        if self.vlc_frame != None:
-            def close_old(frame):
-                if frame:
-                    frame.destroy()  # Bug fix for mp4
-                    frame = None
-            self.vlc_frame.pack_forget()
-            if self.canvas:
-                self.canvas.pack(expand=True, fill=tk.BOTH)
-            Thread(target=close_old, args=(self.old,), daemon=True).start()
-            self.vlc_frame = None
-            self.old = None
-            if self.statusbar.get():
-                self.frame_statusbar.pack_forget()
-                self.divider.pack_forget()
-                self.divider.pack(expand=False, fill=tk.X)
-                self.frame_statusbar.pack(expand=False, fill=tk.X)
-
-    def window_close(self, e=None):
-        from send2trash import send2trash
-        self.save_json()
-        for x in self.undo:
-            path = os.path.normpath(x[0])
-            try:
-                send2trash(path)
-            except Exception as e:
-                print("Trash errors:", e)
-        if self.gui and self.gui.Image_frame:
-            self.gui.Image_frame.set_vals(self.savedata)
-        if self.drag_buffer:
-            self.after_cancel(self.drag_buffer)
-        if self.save:
-            self.after_cancel(self.save)
-        if self.save1:
-            self.after_cancel(self.save1)
-        if self.memory_after_id:
-            self.after_cancel(self.memory_after_id)
-        if self.gif_after_id:
-            self.after_cancel(self.gif_after_id)
-
-        if self.pil_image:
-            try:
-                self.pil_image.close()
-            except:
-                pass
-            finally:
-                self.pil_image = None
-
-        self.image = None
-
-        self.canvas = None
-        self.image_id = None
-        self.frames.clear()
-        self._zoom_cache.clear()
-        self._imagetk_cache.clear()
-
-        if self.gui:
-            self.gui.second_window_viewer = None
-        
-        if self.vlc_frame:
-            self.old.destroy(threaded=False)
-            self.vlc_frame.destroy()
-            self.vlc_frame = None
-            del self.old
-
-        self.destroy()
-        self.master.destroy()
-        
-    # UI
+    "UI creation"
     def create_widgets(self):
         self.create_menu()
         self.create_status_bar()
         self.create_canvas()
         self.bind_mouse_events()
 
-    # Menu
     def create_menu(self):
+        def hints():
+            def on_resize(e):
+                new_width = max(e.width - 20, 20)
+                self.label.config(wraplength=new_width)
+
+            height = 300
+            width = int(height * 1.85)
+            new = tk.Toplevel(self.master, width=width, height=height, bg=self.colors["canvas"])
+            new.transient(self.master)
+            new.geometry(f"{width}x{height}+{int(self.master.winfo_width()/2-width/2)}+{int(self.master.winfo_height()/2-height/2)}")
+            new.grid_rowconfigure(0, weight=1)
+            new.grid_columnconfigure(0, weight=1)
+            text = """Small guide:
+            
+    Double-click: "Center & Resize."
+    Shift or Right-click + Mouse-wheel: "Rotate."
+
+    Show Advanced:
+    Drag: The quality of the render while resizing canvas.
+    Delay: The full quality is render after this delay.
+                """
+
+            self.label = tk.Label(
+                new,
+                text=text,
+                justify='left',
+                anchor='nw', wraplength=height, bg=self.colors["canvas"], fg=self.colors["text"]
+            )
+            self.label.pack(fill='both', expand=False, padx=10, pady=10)
+            new.bind('<Configure>', on_resize)
+
         menu_bar = tk.Menu(self.master)
 
         # File menu
         file_menu = tk.Menu(menu_bar, tearoff=tk.OFF)
         
-
         if not self.gui:
             menu_bar.add_cascade(label="File", menu=file_menu)
             file_menu.add_command(label="Open", command=self.menu_open_clicked, accelerator="Ctrl+O")
@@ -784,11 +655,6 @@ class Application(tk.Frame):
         # View menu
         view_menu = tk.Menu(menu_bar, tearoff=tk.OFF)
         menu_bar.add_cascade(label="View", menu=view_menu)
-
-        self.auto_fit_var = self.auto_fit_var
-        view_menu.add_checkbutton(
-            label="Auto Fit on Resize",
-            variable=self.auto_fit_var)
 
         self.unbound_var = self.unbound_var
         view_menu.add_checkbutton(
@@ -825,7 +691,7 @@ class Application(tk.Frame):
         
         view_menu.add_separator()
 
-        view_menu.add_command(label="Hints", command=self.hints)
+        view_menu.add_command(label="Hints", command=hints)
         
         self.master.bind_all("<Control-o>", self.menu_open_clicked)
         self.master.bind_all("<Control-d>", self.menu_open_dir_clicked)
@@ -833,72 +699,14 @@ class Application(tk.Frame):
         if not self.disable_menubar and self.master.config().get("menu"): # disable menubar for embedded view. (not supported)
             self.master.config(menu=menu_bar)
 
-    def hints(self):
-        height = 300
-        width = int(height * 1.85)
-        new = tk.Toplevel(self.master, width=width, height=height, bg=self.colors["canvas"])
-        new.transient(self.master)
-        new.geometry(f"{width}x{height}+{int(self.master.winfo_width()/2-width/2)}+{int(self.master.winfo_height()/2-height/2)}")
-        new.grid_rowconfigure(0, weight=1)
-        new.grid_columnconfigure(0, weight=1)
-        text = """Small guide:
-        
-Double-click: "Center & Resize."
-Shift or Right-click + Mouse-wheel: "Rotate."
+    def create_status_bar(self):  
+        def get_memory_usage():
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            self.ram_indicator.config(text=f"RAM: {memory_info.rss / (1024 ** 2):.1f} MB")
+            self.memory_after_id = self.after(500, get_memory_usage)
 
-Show Advanced:
-Drag: The quality of the render while resizing canvas.
-Delay: The full quality is render after this delay.
-            """
-
-        self.label = tk.Label(
-            new,
-            text=text,
-            justify='left',
-            anchor='nw', wraplength=height, bg=self.colors["canvas"], fg=self.colors["text"]
-        )
-        self.label.pack(fill='both', expand=False, padx=10, pady=10)
-        new.bind('<Configure>', self.on_resize)
-    
-    def on_resize(self, e):
-        new_width = max(e.width - 20, 20)
-        self.label.config(wraplength=new_width)
-
-    def menu_open_clicked(self, event=None):
-        from tkinter import filedialog
-
-        self.filenames = []
-        temp = filedialog.askopenfilenames(
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.pcx *.tiff *.psd *.jfif *.gif *.webp *.webm *.mp4 *.avif")]
-        )
-        if isinstance(temp, tuple): self.filenames = list(temp)
-        if not self.filenames:
-            return
-        self.lastdir = os.path.dirname(self.filenames[0])
-        self.filename_index = 0
-        self.set_image(self.filenames[self.filename_index])
-
-    def menu_open_dir_clicked(self, event=None):
-        from tkinter import filedialog
-        self.lastdir = filedialog.askdirectory()
-        if not self.lastdir:
-            return
-        file_list = []
-        for root, dirs, files in os.walk(self.lastdir):
-            for file in files:
-                file_list.append(os.path.join(root, file))
-
-        self.filenames = list(x for x in file_list if x.endswith((  ".png", ".jpg", ".jpeg",
-                                                                                            ".bmp", ".pcx", ".tiff",
-                                                                                            ".psd", ".jfif", ".gif",
-                                                                                            ".webp", ".webm", ".mp4", ".avif")))
-        if not self.filenames:
-            return
-        self.filename_index = 0
-        self.set_image(self.filenames[self.filename_index])
-
-    # Statusbar
-    def create_status_bar(self):
         frame_statusbar = tk.Frame(self.master, bd=1, relief=tk.SUNKEN, background=self.colors["statusbar"])
         self.frame_statusbar = frame_statusbar
 
@@ -1007,68 +815,8 @@ Delay: The full quality is render after this delay.
         if self.statusbar.get():
             frame_statusbar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.get_memory_usage()
-    
-    def toggle_statusbar(self):
-        if not self.statusbar.get():
-            self.frame_statusbar.pack_forget()
-            self.divider.pack_forget()
-            if self.vlc_frame:
-                vlc_player = self.old 
-                if vlc_player and vlc_player.video_frame:
-                    w, h = self.master.winfo_geometry().split("+",1)[0].split("x", 1)
-                    w = int(w)
-                    h = int(h)
+        get_memory_usage()
 
-                    vlc_player.video_container.config(width=w, height=h)
-                    vlc_player.video_frame.config(width=w, height=h - 35)  # leave space for controls
-                    vlc_player.controls_frame.config(width=w)
-                    self.master.update()
-            elif self.pil_image:
-                self.zoom_fit()
-        else:
-            self.divider.pack(expand=False, fill=tk.X)
-            self.frame_statusbar.pack(expand=False, fill=tk.X)
-            if self.vlc_frame:
-                vlc_player = self.old
-                if vlc_player and vlc_player.video_frame:
-                    w, h = self.master.winfo_geometry().split("+",1)[0].split("x", 1)
-                    w = int(w)
-                    h = int(h)-20
-
-                    vlc_player.video_container.config(width=w, height=h)
-                    vlc_player.video_frame.config(width=w, height=h - 35)  # leave space for controls
-                    vlc_player.controls_frame.config(width=w)
-            elif self.pil_image:
-                self.zoom_fit()
-
-    def toggle_advanced(self):
-        widgets = [
-            self.filter_delay_input,
-            self.filter_delay_input_label,
-            self.drag_quality_button,
-            self.drag_quality_label
-            ]
-        for x in widgets:
-            if self.show_advanced.get():
-                x.pack(side=tk.RIGHT, pady=0)
-            else:
-                x.pack_forget()
-    
-    def toggle_ram_indicator(self):
-        if self.show_ram.get():
-            self.ram_indicator.pack(side=tk.LEFT)
-        else:
-            self.ram_indicator.pack_forget()
-    
-    def get_memory_usage(self):
-        import psutil
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        self.ram_indicator.config(text=f"RAM: {memory_info.rss / (1024 ** 2):.1f} MB")
-        self.memory_after_id = self.after(500, self.get_memory_usage)
-
-    # Canvas
     def create_canvas(self):
         canvas = tk.Canvas(self.master, background=self.colors["canvas"], highlightthickness=0)
         canvas.pack(expand=True, fill=tk.BOTH)
@@ -1077,6 +825,7 @@ Delay: The full quality is render after this delay.
             self.divider.pack(fill=tk.X)
         canvas.update()
         self.canvas = canvas
+        #self.app2 = ImageViewer(self.master, self.canvas)
         
     def bind_mouse_events(self):
         canvas = self.canvas
@@ -1088,80 +837,96 @@ Delay: The full quality is render after this delay.
         canvas.bind("<Configure>", self.window_resize)
         if self.standalone:
             canvas.bind("<Button-3>", self.window_close)
-          
-    def mouse_move_left(self, event):
-        if event.state == 258:
-            return
-        if self.pil_image and self._old:
-            dx, dy = event.x - self._old.x, event.y - self._old.y
-            self.translate(dx, dy)
 
-            if not self.unbound_var.get():
-                self.restrict_pan()
-            
-            self.draw_image(self.pil_image)
-            self._old = event
+    "Events"
+    def menu_open_clicked(self, event=None): #ui
+        from tkinter import filedialog
 
-    def restrict_pan(self):
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        iw, ih = self.pil_image.width, self.pil_image.height
-
-        tw = iw * self.mat_affine[0, 0]
-        th = ih * self.mat_affine[1, 1]
-
-        tx = self.mat_affine[0, 2]
-        ty = self.mat_affine[1, 2]
-
-        if tw <= cw:
-            tx_min, tx_max = 0, cw - tw
-        else:
-            tx_min, tx_max = cw - tw, 0
-        tx = min(max(tx, tx_min), tx_max)
-
-        if th <= ch:
-            ty_min, ty_max = 0, ch - th
-        else:
-            ty_min, ty_max = ch - th, 0
-        ty = min(max(ty, ty_min), ty_max)
-
-        self.mat_affine[0, 2] = tx
-        self.mat_affine[1, 2] = ty
-
-        scale_up = np.eye(3)
-        _, _, f = self.scale_key
-        inv_f = 1.0 / f
-        scale_up[0,0] = scale_up[1,1] = inv_f
-        self.combined = self.mat_affine @ scale_up
-
-    def mouse_move(self, event):
-        if not self.pil_image:
-            return
-        pt = self.to_image_point(event.x, event.y)
-        self.label_image_pixel.config(
-            text=f"({pt[0]:.2f}, {pt[1]:.2f})" if pt else "(--, --)"
+        self.filenames = []
+        temp = filedialog.askopenfilenames(
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.pcx *.tiff *.psd *.jfif *.gif *.webp *.webm *.mp4 *.avif")]
         )
-
-    def mouse_double_click_left(self, event=None):
-        if event.state == 2:
+        if isinstance(temp, tuple): self.filenames = list(temp)
+        if not self.filenames:
             return
-        if self.pil_image:
-            self.zoom_fit()
-            self.draw_image(self.pil_image)
+        self.lastdir = os.path.dirname(self.filenames[0])
+        self.filename_index = 0
+        self.set_image(self.filenames[self.filename_index])
 
-    def _center_if_smaller(self):
-        """If the scaled image fits entirely in the canvas, center it."""
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        iw, ih = self.pil_image.width, self.pil_image.height
-        s = self.mat_affine[0, 0]
-        tw, th = iw * s, ih * s
+    def menu_open_dir_clicked(self, event=None):
+        from tkinter import filedialog
+        self.lastdir = filedialog.askdirectory()
+        if not self.lastdir:
+            return
+        file_list = []
+        for root, dirs, files in os.walk(self.lastdir):
+            for file in files:
+                file_list.append(os.path.join(root, file))
 
-        if tw <= cw and th <= ch:
-            tx = (cw - tw) / 2
-            ty = (ch - th) / 2
-            self.mat_affine[0, 2] = tx
-            self.mat_affine[1, 2] = ty
+        self.filenames = list(x for x in file_list if x.endswith((  ".png", ".jpg", ".jpeg",
+                                                                                            ".bmp", ".pcx", ".tiff",
+                                                                                            ".psd", ".jfif", ".gif",
+                                                                                            ".webp", ".webm", ".mp4", ".avif")))
+        if not self.filenames:
+            return
+        self.filename_index = 0
+        self.set_image(self.filenames[self.filename_index])
+    
+    def key_press(self, delta=0): #keys
+        if len(self.filenames) <= 1:
+            return
+        if len(self.filenames) > (self.filename_index + delta): # ENSURE INDEX IS THE LENGTH OF THE LIST
+            self.filename_index += delta
+            if self.filename_index < 0: # ENSURE NEGATIVES LOOP
+                self.filename_index = len(self.filenames)-1
+        else: # ENSURE POSITIVES LOOP
+            self.filename_index = 0
+        self.set_image(self.filenames[self.filename_index])
+    
+    def rename(self, event=None):
+        def ask_prefilled_text(parent, title, message, default_text=""):
+            dialog = PrefilledInputDialog(parent, title, message, default_text)
+            return dialog.result
+        if not self.filename: return
+        title = "Rename Image"
+        label = ""
+        path = self.filename
+        old_name = os.path.basename(path)
 
-    def mouse_wheel(self, event):
+        while True:
+            new_name = ask_prefilled_text(
+            self, title, label, default_text=old_name)
+            if new_name:
+                new_path = os.path.join(os.path.dirname(path), new_name)
+                try:
+                    os.rename(path, new_path)
+                    self.set_image(new_path)
+                    break
+                except Exception as e:
+                    print("Rename errors:", e)
+                    label = f"{new_name} already exists in {os.path.basename(os.path.dirname(path))}"
+                    old_name = new_name
+            else:
+                break
+    
+    def trash(self, event=None):
+        if not self.filename or not self.filenames: return
+        path = self.filenames.pop(self.filename_index)
+        self.undo.append((path, self.filename_index))
+        if not self.filenames: self.set_image(None) # doesnt exist, display none
+        elif self.filename_index >= len(self.filenames): # index is over, diosplay latest
+            self.set_image(self.filenames[-1])
+            self.filename_index = len(self.filenames)-1
+        else:
+            self.set_image(self.filenames[self.filename_index]) # index exists
+
+    def on_ctrl_z(self, event=None):
+        if not self.undo: return
+        path, index = self.undo.pop()
+        self.set_image(path)
+        self.filenames.insert(index, path)
+    
+    def mouse_wheel(self, event): #mouse
         if event.state == 2:
             return
         if not self.pil_image:
@@ -1196,18 +961,167 @@ Delay: The full quality is render after this delay.
                     self.restrict_pan()
         self.draw_image(self.pil_image)
 
-    # Key events
-    def key_press(self, delta=0):
-        if len(self.filenames) == 1:
+    def mouse_move(self, event):
+        if not self.pil_image:
             return
-        if len(self.filenames) > (self.filename_index + delta): # ENSURE INDEX IS THE LENGTH OF THE LIST
-            self.filename_index += delta
-            if self.filename_index < 0: # ENSURE NEGATIVES LOOP
-                self.filename_index = len(self.filenames)-1
-        else: # ENSURE POSITIVES LOOP
-            self.filename_index = 0
-        self.set_image(self.filenames[self.filename_index])
+        pt = self.to_image_point(event.x, event.y)
+        self.label_image_pixel.config(
+            text=f"({pt[0]:.2f}, {pt[1]:.2f})" if pt else "(--, --)"
+        )
+
+    def mouse_double_click_left(self, event=None):
+        if event.state == 2:
+            return
+        if self.pil_image:
+            self.zoom_fit(self.pil_image)
+            self.draw_image(self.pil_image)
+
+    def mouse_move_left(self, event):
+        if event.state == 258:
+            return
+        if self.pil_image and self._old:
+            dx, dy = event.x - self._old.x, event.y - self._old.y
+            self.translate(dx, dy)
+
+            if not self.unbound_var.get():
+                self.restrict_pan()
+            
+            self.draw_image(self.pil_image)
+            self._old = event
+    
+    def toggle_statusbar(self): #statusbar
+        if not self.statusbar.get():
+            self.frame_statusbar.pack_forget()
+            self.divider.pack_forget()
+            if self.vlc_frame:
+                vlc_player = self.old 
+                if vlc_player and vlc_player.video_frame:
+                    w, h = self.master.winfo_geometry().split("+",1)[0].split("x", 1)
+                    w = int(w)
+                    h = int(h)
+
+                    vlc_player.video_container.config(width=w, height=h)
+                    vlc_player.video_frame.config(width=w, height=h - 35)  # leave space for controls
+                    vlc_player.controls_frame.config(width=w)
+                    self.master.update()
+            elif self.pil_image:
+                self.zoom_fit(self.pil_image)
+        else:
+            self.divider.pack(expand=False, fill=tk.X)
+            self.frame_statusbar.pack(expand=False, fill=tk.X)
+            if self.vlc_frame:
+                vlc_player = self.old
+                if vlc_player and vlc_player.video_frame:
+                    w, h = self.master.winfo_geometry().split("+",1)[0].split("x", 1)
+                    w = int(w)
+                    h = int(h)-20
+
+                    vlc_player.video_container.config(width=w, height=h)
+                    vlc_player.video_frame.config(width=w, height=h - 35)  # leave space for controls
+                    vlc_player.controls_frame.config(width=w)
+            elif self.pil_image:
+                self.zoom_fit(self.pil_image)
+
+    def toggle_advanced(self):
+        widgets = [
+            self.filter_delay_input,
+            self.filter_delay_input_label,
+            self.drag_quality_button,
+            self.drag_quality_label
+            ]
+        for x in widgets:
+            if self.show_advanced.get():
+                x.pack(side=tk.RIGHT, pady=0)
+            else:
+                x.pack_forget()
+    
+    def toggle_ram_indicator(self):
+        if self.show_ram.get():
+            self.ram_indicator.pack(side=tk.LEFT)
+        else:
+            self.ram_indicator.pack_forget()
+    
+    def window_resize(self, event): #window
+        if (event.widget is self.canvas or event.widget is self.master) and self.pil_image:
+            self.zoom_fit(self.pil_image)
+            self.dragging = True
+
+            self.draw_image(self.pil_image, drag=True, initial_filter=Image.Resampling.NEAREST)
+
+            if self.save1:
+                self.after_cancel(self.save1)
+            
+            #self.update_idletasks() # prevent lag
+            self.save1 = self.after(self.filter_delay.get(), lambda: self.after_idle(lambda: (self._imagetk_cache.clear(), self._zoom_cache.clear(), print("cleared zoom (resize)"), self.draw_image(self.pil_image), setattr(self, "dragging", False))))
+        elif self.vlc_frame:
+            vlc_player = self.old  # or however you store the instance
+            if vlc_player and vlc_player.video_frame:
+                w = event.width
+                h = event.height
+
+                if self.statusbar.get():
+                    h -= 25
+
+                # Resize the containing frames
+                vlc_player.video_container.config(width=w, height=h)
+                
+                vlc_player.video_frame.config(width=w, height=h - 35)  # leave space for controls
+                vlc_player.controls_frame.config(width=w)
+
+    def window_close(self, e=None):
+        from send2trash import send2trash
+        self.save_json()
+        for x in self.undo:
+            path = os.path.normpath(x[0])
+            try:
+                send2trash(path)
+            except Exception as e:
+                print("Trash errors:", e)
+        if self.gui and self.gui.Image_frame:
+            self.gui.Image_frame.set_vals(self.savedata)
+        if self.drag_buffer:
+            self.after_cancel(self.drag_buffer)
+        if self.save:
+            self.after_cancel(self.save)
+        if self.save1:
+            self.after_cancel(self.save1)
+        if self.memory_after_id:
+            self.after_cancel(self.memory_after_id)
+        if self.gif_after_id:
+            self.after_cancel(self.gif_after_id)
+        if self.gif_gen_after_id:
+            self.after_cancel(self.gif_gen_after_id)
+
+        if self.pil_image:
+            try:
+                self.pil_image.close()
+            except:
+                pass
+            finally:
+                self.pil_image = None
+
+        self.image = None
+
+        self.canvas = None
+        self.image_id = None
+        self.frames.clear()
+        with self._frame_lock:
+            self._zoom_cache.clear()
+            self._imagetk_cache.clear()
+
+        if self.gui:
+            self.gui.second_window_viewer = None
         
+        if self.vlc_frame:
+            self.old.destroy(threaded=False)
+            self.vlc_frame.destroy()
+            self.vlc_frame = None
+            del self.old
+
+        self.destroy()
+        self.master.destroy()
+     
+    
     # Affine transforms
     def reset_transform(self):
         self.mat_affine = np.eye(3)
@@ -1249,17 +1163,6 @@ Delay: The full quality is render after this delay.
         self.rotate(deg)
         self.translate(cx, cy)
 
-    def zoom_fit(self):
-        if self.pil_image == None: return
-        iw, ih = self.pil_image.width, self.pil_image.height
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if iw <= 0 or ih <= 0 or cw <= 0 or ch <= 0: return
-        self.reset_transform()
-        s = min(cw / iw, ch / ih)
-        ox, oy = (cw - iw * s) / 2, (ch - ih * s) / 2
-        self.scale(s)
-        self.translate(ox, oy)
-
     def to_image_point(self, x, y):
         try:
             inv = np.linalg.inv(self.mat_affine)
@@ -1270,61 +1173,283 @@ Delay: The full quality is render after this delay.
             pass
         return []
     
-    def pyvips_to_pillows(self, filename):
-        def get_mode(vips_img):
-            pformat = str(vips_img.interpretation).lower()
-            "Most common formats are srgb, b-w, rgb16 and grey16. We get the pillows equivalent 'mode' for frombytes method"
-            if pformat == "srgb":
-                if vips_img.bands == 3: mode = "RGB"
-                elif vips_img.bands == 4: 
-                    mode = "RGBA" # Transparency. Able to view photos with transparent background.
-            elif pformat == "b-w":
-                mode = "L"
-            elif pformat == "rgb16":
-                mode = "I;16"
-            elif pformat == "grey16":
-                mode = "I;16"
-            else:
-                print("Our pyvips interpreter encountered an unsupported format (not srgb, b-w, rgb16 or grey16):", vips_img.interpretation, filename)
-            return mode
-        
+    def zoom_fit(self, handle):
+        if handle == None: return
+        iw, ih = handle.width, handle.height
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if iw <= 0 or ih <= 0 or cw <= 0 or ch <= 0: return
+        self.reset_transform()
+        s = min(cw / iw, ch / ih)
+        ox, oy = (cw - iw * s) / 2, (ch - ih * s) / 2
+        self.scale(s)
+        self.translate(ox, oy)
+
+    def _load_full_image_in_background(self, path, obj):
+        """Runs in a background thread, purely for decoding."""
         try:
-            vips_img = pyvips.Image.new_from_file(filename)
-            mode = get_mode(vips_img)
-            buffer = vips_img.write_to_memory()
-            pil_img = Image.frombytes(
-                mode, (vips_img.width, vips_img.height), buffer, "raw")
-            return pil_img
+            from PIL import Image
+            img = Image.open(path)
+            # Optional: disable full load for very large files to avoid memory spikes
+            img.draft("RGBA", (4096, 4096))
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            return img
         except Exception as e:
-            print(f"Pyvips couldn't load thumbnail from data: {filename} : Error: {e}.")
+            print("Background load error:", e)
+            return None
+
+    def _on_async_image_ready(self, path, image, token):
+        """Called in main thread after background decode finishes."""
+        if getattr(self, "current_load_token", None) != token:
+            image.close()
+            image = None
+            return  # outdated load result, ignore
+
+        if image is None:
+            print("Image load failed for:", path)
             return
+
+        self.pil_image = image
+        self.zoom_fit(image)
+        with self._frame_lock:
+            self._zoom_cache.set_maxsize(32)
+            self._imagetk_cache.set_maxsize(0)
+
+        id1 = self.after(1, lambda: self.draw_image(image, initial_filter=self.drag_quality))
+        id2 = self.after(1, self.draw_image, image)
+        self.draw_queue.extend([id1, id2])
+
         
-    # Image Display
-    def clear(self, filename):
-        if self._secondary_after_id:
-            self.after_cancel(self._secondary_after_id)
-        if self.gif_after_id:
-            self.after_cancel(self.gif_after_id)
+    "Display"
+    def _set_info(self, filename, ext, is_video=False):
+        if not is_video:
+            x, y = (self.pil_image.width, self.pil_image.height)
+        self.master.winfo_toplevel().title(f"{self.title} - {os.path.basename(filename)} - {self.filename_index+1}/{len(self.filenames)}")
+
+        size_mb = os.path.getsize(filename) / (1024*1024)
+        self.label_image_size_var.set(f"{size_mb:^5.1f}MB")
+
+        self.label_image_format_var.set(f"{ext.upper() if is_video else self.pil_image.format:^4}:")
+        self.label_image_mode_var.set(f"{ext.upper() if is_video else self.pil_image.mode:^4}")
+        
+        if is_video: return # vlcplayer will set this label.
+        text = f"{x}x{y}"
+        self.label_image_dimensions_var.set(f"{text:^11}")
+        return (x, y)
+    
+    def _set_thumbnail(self, thumbpath=None):
+        start = perf_counter()
+        with self._frame_lock:
+            self._zoom_cache.set_maxsize(0) # wont allow thumbnail in cache
+            self._imagetk_cache.set_maxsize(0)
+        f1 = Image.Resampling.NEAREST if self.thumbnail_var.get() == "Fast" else Image.Resampling.LANCZOS
+    
+        if thumbpath:
+            with Image.open(thumbpath) as thumb:
+                vips_img = pyvips.Image.thumbnail(thumbpath, max((16, 16)))
+                buffer = vips_img.write_to_memory()
+                mode = self.get_mode(vips_img)
+                resized = Image.frombytes(mode, (vips_img.width, vips_img.height), buffer, "raw")
+                resized = resized.resize((thumb.width, thumb.height), f1)
+        elif True:
+            def superfast_blurry_thumbnail(filename):
+                import pyvips
+                from PIL import Image
+
+                # You can adjust this; 4–8 is a good balance
+                s = 16
+
+                # Step 1️⃣ Decode a small thumbnail with correct aspect ratio
+                vips_img = pyvips.Image.thumbnail(filename, self.x // s)
+
+                # Step 2️⃣ Blur to hide compression/blockiness
+                vips_img = vips_img.gaussblur(2)
+
+
+                # Step 4️⃣ Convert to Pillow Image
+                mode = "RGB" if vips_img.bands == 3 else "RGBA"
+                buf = vips_img.write_to_memory()
+
+                return Image.frombuffer(
+                    mode,
+                    (vips_img.width, vips_img.height),
+                    buf,
+                    "raw",
+                    mode,
+                    0,
+                    1
+                )
+
+            resized = superfast_blurry_thumbnail(self.filename)
+        if resized.mode != "RGBA":
+            resized = resized.convert("RGBA")
+
+        self.zoom_fit(resized)
+        self.draw_image(resized, ignore_anti_alias=True, initial_filter=Image.Resampling.NEAREST)
+      
+    def _set_picture(self, handle=None, obj=None):
+        "Close the handle and load full copy to memory."
+        
+        if handle: self.pil_image = handle
+        def helper():
+            if self.pil_image.mode != "RGBA": temp = self.pil_image.convert("RGBA")
+            else: temp = self.pil_image.copy()
+            self.pil_image = temp
+
+            def helper():
+                self.zoom_fit(self.pil_image)
+
+                with self._frame_lock:
+                    self._zoom_cache.set_maxsize(32)
+                    self._imagetk_cache.set_maxsize(0)
+
+
+                id1 = self.after(1, lambda: self.draw_image(self.pil_image, initial_filter=self.drag_quality))
+                id2 = self.after(1, self.draw_image, self.pil_image)
+                self.draw_queue.extend([id1, id2])
+
+            id = self.after_idle(helper)
+            self.draw_queue.append(id)
+            
+
+        id = self.after_idle(helper)
+        self.draw_queue.append(id)
+        
+    def _set_animation(self, obj=None):
+        self.is_gif = True
+        self.zoom_fit(self.pil_image)
+        self.pil_image.close()
+        self.open_thread = Thread(target=self._preload_frames, args=(self.filename,), name="(Thread) Viewer frame preload", daemon=True)
+        self.open_thread.start()
+
+        self.timer1 = perf_counter()
+        
+
+        #self._preload_frames(self.pil_image)
+        #self._update_frame()
+        
+    def _set_video(self):
+        def close_vlc():
+            if self.vlc_frame != None:
+                    
+                self.vlc_frame.pack_forget()
+                if self.canvas:
+                    self.canvas.pack(expand=True, fill=tk.BOTH)
+                if self.old:
+                    self.old.player.pause()
+                    self.old.destroy()  # Bug fix for mp4
+                    self.old = None
+                self.vlc_frame = None
+                self.old = None
+
+        self._set_info(self.filename, self.ext, is_video=True)
+        #self.update()
+        close_vlc()
+        f = self.vlc_frame == None
+        new = Application.VlcPlayer(self, self.master.winfo_geometry().split("+",1)[0], self.filename, self.label_image_dimensions_var)
+        if f and self.statusbar.get():
+            self.frame_statusbar.pack_forget()
+            self.divider.pack_forget()
+            self.divider.pack(expand=False, fill=tk.X)
+            self.frame_statusbar.pack(expand=False, fill=tk.X)
+        #self.update()
+        self.a = False
+        self.old = new
+     
+    def set_image(self, filename, obj=None):
+        if self.a: 
+            return
+        self.a = True
+        self.current_load_token = object()
+        " Give image path and display it "
+        self.timer.start()
+        
+        """if hasattr(self, "loader") and self.loader:
+            self.loader.stop()"""
+
+        if not self.reset(filename): return # returns False if we cant clear the canvas or cant set the image. (unsupported format)
+        
+        self.filename = filename
+        self.ext = filename.rsplit(".", 1)[1]
+        
+        thumbpath = None if not obj or self.thumbnail_var.get().lower() == "no" else obj.thumbnail
+        if self.ext in ("mp4", "webm"): # is video
+            if thumbpath:
+                self._set_thumbnail(thumbpath=thumbpath)
+            id1 = self.after(1, self._set_video)
+            self.draw_queue.append(id1)
+            return
+
+        self.pil_image = Image.open(self.filename) if self.ext != "avif" else self.pyvips_to_pillows(self.filename)
+        self.x, self.y = self._set_info(self.filename, self.ext)
+        thumbpath = None if not obj or self.thumbnail_var.get().lower() == "no" else obj.thumbnail
+
+        if self.ext in ("gif", "webp"): # is animation
+            if thumbpath:
+                self._set_thumbnail(thumbpath=thumbpath)
+            self._set_animation(obj)
+            self.a = False
+        else: # is picture
+            #self._set_picture(obj)
+            if thumbpath:
+                self._set_thumbnail(thumbpath=thumbpath)
+
+            self.zoom_fit(self.pil_image)
+            self.a = False
+
+            self.loader.request_load(filename, obj)
+
+    def reset(self, filename):
+        def close_vlc():
+            if self.vlc_frame != None:
+                def close_old(frame):
+                    if frame:
+                        frame.player.pause()
+                        frame.destroy()  # Bug fix for mp4
+                        frame = None
+                self.vlc_frame.pack_forget()
+                if self.canvas:
+                    self.canvas.pack(expand=True, fill=tk.BOTH)
+                close_old(self.old)
+                self.vlc_frame = None
+                self.old = None
+                if self.statusbar.get():
+                    self.frame_statusbar.pack_forget()
+                    self.divider.pack_forget()
+                    self.divider.pack(expand=False, fill=tk.X)
+                    self.frame_statusbar.pack(expand=False, fill=tk.X)
+
+        for call in self.draw_queue:
+            self.after_cancel(call)
+            print("cleared")
+        self.draw_queue.clear()
         if self.open_thread and self.open_thread.is_alive():
             self._stop_thread.set()
             self.open_thread.join(timeout=2)
             if self.open_thread.is_alive():
                 print("Warning: frame loader thread didn't exit cleanly")
+        if self.gif_after_id:
+            self.after_cancel(self.gif_after_id)
+        if self.gif_gen_after_id:
+            self.after_cancel(self.gif_gen_after_id)
+        if self.draw_img_id:
+            self.after_cancel(self.draw_img_id)
         if self.pil_image:
             try:
                 self.pil_image.close()
                 self.pil_image = None
             except Exception:
                 pass
-            
-        self._secondary_after_id = None
+        
         self.gif_after_id = None
+        self.gif_gen_after_id = None
         self.open_thread = None
         self._stop_thread.clear()
 
         self.frames.clear()
-        self._zoom_cache.clear()
-        self._imagetk_cache.clear()
+        with self._frame_lock:
+            self._zoom_cache.clear()
+            self._imagetk_cache.clear()
         self.debug.clear()
         self.lazy_index = 0
         
@@ -1335,13 +1460,17 @@ Delay: The full quality is render after this delay.
         self.first_render_info = None
         self.canvas.delete("_IMG")
         
-        if not filename or not os.path.exists(filename): pass
+        if not filename or not os.path.exists(filename): 
+            self.a = False
+            pass
         else:
             ext = filename.rsplit(".", 1)[1]
             supported_formats = {"png", "gif", "jpg", "jpeg", "bmp", "pcx", "tiff", "webp", "psd", "jfif", "avif", "mp4", "webm"}
             if ext in supported_formats:
                 if ext not in ("mp4", "webm"):
-                    self.close_vlc()
+                    self.update()
+                    close_vlc()
+                    self.update()
                 self.f = True
                 return True
                 
@@ -1351,152 +1480,225 @@ Delay: The full quality is render after this delay.
                 self.label_image_mode_var.set("")
                 self.label_image_dimensions_var.set("")
                 self.label_image_size_var.set("")
-                self.close_vlc()
+                self.update()
+                close_vlc()
+                self.update()
+                self.a = False
                 return False
-    
-    def _open_handle(self, filename, ext):
-        return Image.open(filename) if ext != "avif" else self.pyvips_to_pillows(filename)
 
-    def _set_dimensions(self, handle):
-        self.pil_image = handle
-        self.zoom_fit()
-        self.pil_image = None
-
-    def _close_handle(self, handle):
-        handle.close()
-
-    def _set_video(self, filename):
-        def close_old(frame):
-            if frame:
-                frame.destroy()
-                frame = None
-        f = self.vlc_frame == None
-
-        new = Application.VlcPlayer(self, self.master.winfo_geometry().split("+",1)[0], filename, self.label_image_dimensions_var)
-        if f and self.statusbar.get():
-            self.frame_statusbar.pack_forget()
-            self.divider.pack_forget()
-            self.divider.pack(expand=False, fill=tk.X)
-            self.frame_statusbar.pack(expand=False, fill=tk.X)
-        Thread(target=close_old, args=(self.old,), daemon=True).start()
-        self.old = new
-        
-    def _set_animation(self, filename):
-        self.is_gif = True
-        self.open_thread = Thread(target=self._preload_frames, args=(filename,), daemon=True)
-        self.open_thread.start()
-        self.secondary()
-
-    def _set_thumbnail(self, thumbpath):
-        self._zoom_cache.set_maxsize(0)
-        self._imagetk_cache.set_maxsize(0)
-        with Image.open(thumbpath) as thumb_img: # resize the thumbnail to whatever is needed for the given mat_affine
-            self.draw_image(thumb_img, skip_internal_scaling=True, special=True)
-
-    def _set_static(self, handle, use_thumbnail):
-        "Close the handle and load full copy to memory."
-        if handle.mode != "RGBA": temp = handle.convert("RGBA")
-        else: temp = handle.copy() 
-        self.pil_image = temp
-        self._zoom_cache.set_maxsize(32)
-        self._imagetk_cache.set_maxsize(0)
-        self.draw_image(self.pil_image, special=not use_thumbnail)
-
-    def _set_labels(self, filename, ext, handle=None, is_video=False):
-        self.master.winfo_toplevel().title(f"{self.title} - {os.path.basename(filename)} - {self.filename_index+1}/{len(self.filenames)}")
-
-        size_mb = os.path.getsize(filename) / (1024*1024)
-        self.label_image_size_var.set(f"{size_mb:^5.1f}MB")
-
-        self.label_image_format_var.set(f"{ext.upper() if is_video else handle.format:^4}:")
-        self.label_image_mode_var.set(f"{ext.upper() if is_video else handle.mode:^4}")
-        
-        if is_video: return # vlcplayer will set this label.
-        text = f"{handle.width}x{handle.height}"
-        self.label_image_dimensions_var.set(f"{text:^11}")
-
-    def set_image(self, filename, obj=None):
-        " Give image path and display it "
-        self.timer.start()
-        if not self.clear(filename): return # returns False if we cant clear the canvas or cant set the image. (unsupported format)
-        self.filename = filename
-        ext = filename.rsplit(".", 1)[1]
-
-        use_thumbnail = True if obj and self.thumbnail_var.get() != "No thumbs" else False
-        self.bg_color = tuple(int(self.colors["canvas"][i:i+2], 16) for i in (1, 3, 5)) + (0,)
-        
-        is_video = ext in ("mp4", "webm")
-        if is_video:
-            self._set_labels(filename, ext, is_video)
-            self._set_video(filename)
-            return
-        
-        handle = self._open_handle(filename, ext) # avif poorly supported. loads whole image.
-        self._set_dimensions(handle)
-        self._set_labels(filename, ext, handle)
-        
-        if use_thumbnail:
-            self._set_thumbnail(obj.thumbnail)
-            self.timer.start()
-        
-        is_animation = ext in ("gif", "webp") and hasattr(handle, "n_frames") and handle.n_frames not in (0, 1)
-        if is_animation:
-            self._set_animation(filename)
-        else:
-            self._set_static(handle, use_thumbnail)
-        self._close_handle(handle)
-                    
-    def _preload_frames(self, img):
+    "ANIMATION"
+    def _preload_frames(self, filename):
         def fallback():
             self.is_gif = False
-            img.seek(0)
-            if img.mode != "RGBA": self.pil_image = img.convert("RGBA")
-            else: self.pil_image = img.copy()
-            self._set_static(use_thumbnail=False)
+            self.frames.clear()
+            self._set_picture(handle)
+        if self._stop_thread.is_set(): return
         try:
-            with Image.open(img, "r") as img:
+            with Image.open(filename, "r") as handle:
                 i = 0
                 while True:
-                    try:
-                        if self._stop_thread.is_set(): break
-                        img.seek(i)
-                        duration = img.info.get('duration', 100) or 100
-                        frame = img.convert("RGBA")
-                        with self._frame_lock:
-                            self.frames.append((frame, duration))
-                        i += 1
+                    if self._stop_thread.is_set(): break
+                    if i == 1: self.after(1, self._update_frame)
+                    handle.seek(i)
+                    duration = handle.info.get('duration', 100) or 100
+                    frame = handle.convert("RGBA")
+                    i += 1
+                    with self._frame_lock:
+                        self.frames.append((frame, duration))
                         self._zoom_cache.set_maxsize(i)
                         self._imagetk_cache.set_maxsize(i)
-                    except EOFError: break
-                    except Exception as e:
-                        if i == 1:
-                            with self._frame_lock:
-                                self.frames.clear()
-                            self.after(0, fallback)
-                        print("Error in _preload_frames, falling back as a static image.", e)
-                        break
 
-        except Exception as e:
-            print(e)
-        finally:
-            self._stop_thread.clear()
+        except EOFError: 
+            if i == 1:
+                handle.seek(0)
+                self.after(0, fallback)
+                print("Error in _preload_frames (eoferror), falling back as a static image.")
         
-    def secondary(self, lazy_index=0):
+    def _update_frame(self, lazy_index=0, gif_duration1=10000000):
+        if not self.is_gif: return
+        self.timer.start()
         frames = self.frames
-        if not self.is_gif: 
-            self._set_static(use_thumbnail=False)
-            return
-        if not frames:
-            self._secondary_after_id = self.after(16, lambda: self.secondary(lazy_index))
-            return
+        if not frames: return
         with self._frame_lock:
             self.pil_image, gif_duration = frames[lazy_index] # Updates reference (for panning/zooming)
-        self.after(0, lambda: (self.draw_image(self.pil_image, drag=self.dragging), self.anim_info.config(text=f"F: {lazy_index}/{len(frames)}/{gif_duration}ms")))
-        
-        self.gif_after_id = self.after(gif_duration, lambda: self.secondary(lazy_index))
+        self.anim_info.config(text=f"F: {lazy_index}/{len(frames)}/{gif_duration}ms")
+
+        elapsed = perf_counter() - self.timer1
+        self.timer1 = perf_counter()
+        if elapsed*1000 > gif_duration1+3:
+            print("Animation is running slow (3>ms)")
+        """if elapsed*1000 > gif_duration1+3 and self.open_thread.is_alive():
+            lazy_index = 0
+        else:"""
         lazy_index = (lazy_index + 1) % len(frames)
         self.lazy_index = lazy_index
+        self.gif_after_id = self.after(gif_duration, lambda: self._update_frame(lazy_index, gif_duration))
+        self.after(0, self.draw_image(self.pil_image, drag=self.dragging, initial_filter=Image.Resampling.NEAREST if self.dragging else None))
+        
 
+    "Rendering"
+    def draw_image(self, pil_image, drag=False, ignore_anti_alias=False, initial_filter=None):
+        start = perf_counter()
+        def calc_transform(aa, zoom):
+            matrix = self.mat_affine
+            if aa and ((zoom < 1.0)): matrix = self.combined
+            inv = np.linalg.inv(matrix)
+            affine_inv = (inv[0,0], inv[0,1], inv[0,2], 
+                        inv[1,0], inv[1,1], inv[1,2])
+            return affine_inv
+        def get_transform_filter(aa, gif, resize_filter):
+            if aa or gif: transform_filter = Image.Resampling.NEAREST
+            elif resize_filter == Image.Resampling.LANCZOS or resize_filter == "pyvips": transform_filter = Image.Resampling.BICUBIC
+            else: transform_filter = resize_filter
+            return transform_filter
+        def get_transform_key(lazy_index, scale_key, affine_inv, cw, ch, transform_filter):
+            affine_bucket = (round(affine_inv[0], 3), round(affine_inv[1], 3), int(round(affine_inv[2])), round(affine_inv[3], 3), round(affine_inv[4], 3), int(round(affine_inv[5])))
+            transform_key = (lazy_index, scale_key, affine_bucket, cw, ch, int(transform_filter))
+            return transform_key # pan/zoom/rotation key     
+        def get_source(pil_img_variables): # movements pan/zoom/rotation
+            pil_image, aa, should_blur, resize_filter = pil_img_variables
+            with self._frame_lock:
+                if self._zoom_cache:
+                    zoom_cache = True
+                else: 
+                    zoom_cache = False
+            if not aa or zoom >= 1.0:
+                return pil_image
+            elif should_blur and zoom_cache: # gen levels from cached instead for a blur effect and maybe perf?
+                with self._frame_lock:
+                    tupl, cached = self._zoom_cache.last()
+                index, last_zoom_key = tupl
+                f = last_zoom_key / 1000
+                size1 = max(1, round(pil_image.width * f)), max(1, round(pil_image.height * f))
+                zoom_key = (self.lazy_index, last_zoom_key)
+                with self._frame_lock:
+                    self._zoom_cache.clear()
+                    cached = cached or pil_image.resize(size1, self.drag_quality)
+                    self._zoom_cache[zoom_key] = cached
+                    
+
+                if zoom >= 1.0: # DRAGGING bigger
+                    resized = cached.resize((pil_image.width, pil_image.height), self.drag_quality)
+                elif zoom < 1.0:# DRAGGING smaller
+                    resized = cached.resize(size, self.drag_quality)
+                    if scale_key < last_zoom_key:
+                        resized = pil_image.resize(size, self.drag_quality)
+                        new_zoom_key = (self.lazy_index, scale_key)
+                        with self._frame_lock:
+                            self._zoom_cache.clear()
+                            self._zoom_cache[new_zoom_key] = resized   
+            elif zoom < 1.0: # thumb gen # window resize resets caches
+                use_pyvips = resize_filter == "pyvips"
+                if gif:
+                    try:
+                        f1 = Image.Resampling.LANCZOS if use_pyvips else resize_filter
+                        resized = pil_image.resize(size, f1)
+                    except Exception as e:
+                        print("Error in draw (gif):", e)
+                else:
+                    try:
+                        if use_pyvips:
+                            vips_img = pyvips.Image.thumbnail(self.filename, max(size))
+                            buffer = vips_img.write_to_memory()
+                            mode = self.get_mode(vips_img)
+                            resized = Image.frombytes(mode, (vips_img.width, vips_img.height), buffer, "raw")
+                        else:
+                            resized = pil_image.resize(size, resize_filter)
+                    except Exception as e:
+                        print("Error in draw:", e)
+                        return
+                if resized.mode != "RGBA": resized = resized.convert("RGBA")
+                with self._frame_lock:
+                    self._zoom_cache[(self.lazy_index, scale_key)] = resized
+            return resized 
+        def get_imagetk(resized_pil_img: Image.Image=None, variables=None): # static redraws for animation
+            if not resized_pil_img and not variables: return
+            source = resized_pil_img or get_source(variables)
+
+            dst = source.transform((cw, ch), Image.AFFINE, affine_inv, resample=transform_filter, fillcolor=self.bg_color)
+            imagetk = ImageTk.PhotoImage(dst)
+            if gif and not drag: 
+                with self._frame_lock:
+                    self._imagetk_cache[transform_key] = imagetk
+            return imagetk
+        
+        # prefetch values
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw <= 1 or ch <= 1 or pil_image == None: return
+        aa = False if ignore_anti_alias else self.anti_aliasing.get() 
+        gif = self.is_gif
+        lazy_index = self.lazy_index
+        zoom, scale_key, f = self.scale_key # scale key is precomputed by get_scale_key each time def scale() is called.
+        size = max(1, round(pil_image.width * f)), max(1, round(pil_image.height * f)) # calc desired size
+
+        # prefs
+        resize_filter = initial_filter if initial_filter is not None else self.filter
+        resize_blur = True
+        resize_blur_for_gif = False
+        should_blur = resize_blur_for_gif and drag if gif else resize_blur and drag
+        
+        affine_inv = calc_transform(aa, zoom) # calculate the transform
+        transform_filter = get_transform_filter(aa, gif, resize_filter) # generate keys for cache
+        transform_key = get_transform_key(lazy_index, scale_key, affine_inv, cw, ch, transform_filter) # anim rame, scale, transformation, canvas size and filter determine render cache key. (imagetk)
+        zoom_key = (lazy_index, scale_key) # zoom level is just frame and scale (pil_image)
+        
+        def clean_cache(resize_blur_for_gif, gif, zoom):
+            if not resize_blur_for_gif and gif:
+                if zoom > 1.0: # zoom below 1.0 shouldnt keep cache alive for gif.
+                    with self._frame_lock:
+                        self._zoom_cache.clear()
+                elif drag: # dragging shouldnt keep any cache alive for gif.
+                    with self._frame_lock:
+                        self._zoom_cache.clear()
+                        self._imagetk_cache.clear()
+        clean_cache(resize_blur_for_gif, gif, zoom)
+        with self._frame_lock:
+            imagetk = self._imagetk_cache.__getitem__(transform_key) if gif else None
+        if not imagetk:
+            with self._frame_lock:
+                cached_pil_image = self._zoom_cache.__getitem__(zoom_key)
+            if cached_pil_image:
+                imagetk = get_imagetk(resized_pil_img=cached_pil_image)
+            else:
+                imagetk = get_imagetk(variables=(pil_image, aa, should_blur, resize_filter))
+        if initial_filter is not None and not drag: # removes the initial render from the cache.
+            with self._frame_lock:
+                self._zoom_cache.clear()
+                self._imagetk_cache.clear()
+        
+        if self.image_id: self.canvas.itemconfig(self.image_id, image=imagetk)
+        else: self.image_id = self.canvas.create_image(0, 0, anchor='nw', image=imagetk, tags="_IMG")
+        self.image = imagetk
+        time = self.timer.stop()
+        if self.f:
+            #print("1st:", time, len(self._zoom_cache))
+            self.f = False
+            self.first_render_info = f"R: {time}"
+            self.render_info.config(text=f"{self.first_render_info} ms")
+        else:
+            #print(time, len(self._zoom_cache))
+            self.debug.append(float(self.timer.stop()))
+            if len(self.debug) > 10:
+                self.debug.pop(0)
+            test = sum(self.debug)/len(self.debug)
+            if len(self.debug) == 1:
+                self.render_info.config(text=f"{self.first_render_info}, {test:.1f} ms")
+        if self.gui and drag: return
+        self.update_idletasks() # idea is that no queue is formed.
+
+    "Helpers"
+    def pyvips_to_pillows(self, filename):
+        try:
+            vips_img = pyvips.Image.new_from_file(filename)
+            mode = self.get_mode(vips_img)
+            buffer = vips_img.write_to_memory()
+            pil_img = Image.frombytes(
+                mode, (vips_img.width, vips_img.height), buffer, "raw")
+            return pil_img
+        except Exception as e:
+            print(f"Pyvips couldn't load thumbnail from data: {filename} : Error: {e}.")
+            return
+        
     def get_scale_key(self):
         mat = self.mat_affine
         sx, sy = (mat[0, 0]**2 + mat[1, 0]**2)**0.5, (mat[0, 1]**2 + mat[1, 1]**2)**0.5
@@ -1522,121 +1724,39 @@ Delay: The full quality is render after this delay.
             mode = "I;16"
         return mode
     
-    def draw_image(self, pil_image, drag=False, skip_internal_scaling=None, special=False, latest=False):
-        resize_blur = False
-        resize_blur_for_gif = False
-        aa = self.anti_aliasing.get()
-        gif = self.is_gif
-
-        if not special: self.timer.start()
+    def restrict_pan(self):
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if cw <= 1 or ch <= 1 or pil_image == None: return
-        zoom, scale_key, f = self.scale_key
-        size = max(1, round(pil_image.width * f)), max(1, round(pil_image.height * f))
-        
-        matrix = self.mat_affine
-        if aa and (skip_internal_scaling or (zoom < 1.0)):
-            matrix = self.combined
-        inv = np.linalg.inv(matrix)
-        affine_inv = (inv[0,0], inv[0,1], inv[0,2], 
-                      inv[1,0], inv[1,1], inv[1,2])
-        affine_bucket = (round(affine_inv[0], 3), round(affine_inv[1], 3), int(round(affine_inv[2])), round(affine_inv[3], 3), round(affine_inv[4], 3), int(round(affine_inv[5])))
-        
-        if aa or gif:
-            transform_filter = Image.Resampling.NEAREST
-        elif self.filter == Image.Resampling.LANCZOS or self.filter == "pyvips":
-            transform_filter = Image.Resampling.BICUBIC
+        iw, ih = self.pil_image.width, self.pil_image.height
+
+        tw = iw * self.mat_affine[0, 0]
+        th = ih * self.mat_affine[1, 1]
+
+        tx = self.mat_affine[0, 2]
+        ty = self.mat_affine[1, 2]
+
+        if tw <= cw:
+            tx_min, tx_max = 0, cw - tw
         else:
-            transform_filter = self.filter
+            tx_min, tx_max = cw - tw, 0
+        tx = min(max(tx, tx_min), tx_max)
 
-        transform_key = (self.lazy_index, scale_key, affine_bucket, cw, ch, int(transform_filter)) # pan/zoom/rotation key
-        imagetk = self._imagetk_cache.__getitem__(transform_key) if gif else None
-        source = self._zoom_cache.__getitem__((self.lazy_index, scale_key))
-        new_scale_key = scale_key
-        should_blur = resize_blur_for_gif and drag if gif else resize_blur and drag
-
-        if not resize_blur_for_gif and gif:
-            if zoom > 1.0: # zoom below 1.0 shouldnt keep cache alive for gif.
-                self._zoom_cache.clear()
-            elif drag: # dragging shouldnt keep any cache alive for gif.
-                self._zoom_cache.clear()
-                self._imagetk_cache.clear()
-        if not imagetk: # skip all processing if cached (gif)
-            if not source:
-                source = pil_image
-                if not aa: pass
-                elif should_blur and self._zoom_cache: # gen anti-aliased thumbnails at zoom levels.
-                    tupl, source = self._zoom_cache.last()
-                    index, scale_key = tupl
-                    f = scale_key / 1000
-                    size1 = max(1, round(pil_image.width * f)), max(1, round(pil_image.height * f))
-                    source = self._zoom_cache.get((self.lazy_index, scale_key), None) or pil_image.resize(size1, self.drag_quality)
-                    self._zoom_cache[(self.lazy_index, scale_key)] = source
-
-                    if zoom >= 1.0: # DRAGGING bigger
-                        source = source.resize((pil_image.width, pil_image.height), self.drag_quality)
-                    elif zoom < 1.0:# DRAGGING smaller
-                        source = source.resize(size, self.drag_quality)
-                        if new_scale_key < scale_key:
-                            source = pil_image.resize(size, self.drag_quality)
-                            self._zoom_cache[(self.lazy_index, new_scale_key)] = source
-                    
-                elif zoom < 1.0: # thumb gen # window resize resets caches
-                    source = self._zoom_cache.__getitem__((self.lazy_index, scale_key))
-                    if not source:
-                        use_pyvips = self.filter == "pyvips"
-                        if gif:
-                            try:
-                                f1 = Image.Resampling.LANCZOS if use_pyvips else self.filter
-                                source = pil_image.resize(size, f1)
-                            except Exception as e:
-                                print("Error in draw (gif):", e)
-                        else:
-                            try:
-                                if use_pyvips:
-                                    vips_img = pyvips.Image.thumbnail(self.filename, max(size))
-                                    buffer = vips_img.write_to_memory()
-                                    mode = self.get_mode(vips_img)
-                                    source = Image.frombytes(mode, (vips_img.width, vips_img.height), buffer, "raw")
-                                else:
-                                    source = pil_image.resize(size, self.filter)
-                            except Exception as e:
-                                print("Error in draw:", e)
-                                return
-                        if source.mode != "RGBA": source = source.convert("RGBA")
-                        self._zoom_cache[(self.lazy_index, scale_key)] = source
-            else:
-                pass  
-
-            dst = source.transform((cw, ch), Image.AFFINE, affine_inv, resample=transform_filter, fillcolor=self.bg_color)
-            imagetk = ImageTk.PhotoImage(dst)
-            if gif and not drag:
-                self._imagetk_cache[transform_key] = imagetk
+        if th <= ch:
+            ty_min, ty_max = 0, ch - th
         else:
-            pass
+            ty_min, ty_max = ch - th, 0
+        ty = min(max(ty, ty_min), ty_max)
 
-        # refs
-        self.image = imagetk
-        if self.image_id: self.canvas.itemconfig(self.image_id, image=imagetk)
-        else: self.image_id = self.canvas.create_image(0, 0, anchor='nw', image=imagetk, tags="_IMG")
-        
-        if self.f:
-            self.f = False
-            time = self.timer.stop()
-            self.first_render_info = f"R: {time}"
-            self.render_info.config(text=f"{self.first_render_info} ms")
-        else:
-            self.debug.append(float(self.timer.stop()))
-            if len(self.debug) > 10:
-                self.debug.pop(0)
-            test = sum(self.debug)/len(self.debug)
-            self.render_info.config(text=f"{self.first_render_info}, {test:.1f} ms")
+        self.mat_affine[0, 2] = tx
+        self.mat_affine[1, 2] = ty
 
-        self.update_idletasks() # idea is that no queue is formed.
+        scale_up = np.eye(3)
+        _, _, f = self.scale_key
+        inv_f = 1.0 / f
+        scale_up[0,0] = scale_up[1,1] = inv_f
+        self.combined = self.mat_affine @ scale_up
 
-    # Preferences
+    "Preferences"
     def set_vals(self, savedata):
-        self.auto_fit_var.set(savedata.get("auto_fit_on_resize", self.auto_fit_var.get()))
         self.unbound_var.set(savedata.get("unbound_pan", self.unbound_var.get()))
 
         self.statusbar.set(savedata.get("statusbar", self.statusbar.get()))
@@ -1670,7 +1790,6 @@ Delay: The full quality is render after this delay.
                 "disable_menubar": self.disable_menubar,        # Disable the menu bar
                 "statusbar": self.statusbar.get(),     # Disable the statusbar
                 "lastdir": self.lastdir or None,                # Last folder viewed
-                "auto_fit_on_resize": self.auto_fit_var.get(),  # Refit to window when resizing
                 "unbound_pan": self.unbound_var.get(),          # Go out of bounds
                 "rotation_degrees": self.rotation_degrees,        # Rotation amount
                 "zoom_magnitude": self.zoom_magnitude,                # Zoom amount
@@ -1702,6 +1821,6 @@ class Timer:
         return (f"{elapsed_time:.1f}")
     
 if __name__ == "__main__":
-    app = Application() # master
+    app = Application()
     #app.set_image(path)
     app.master.mainloop() 
