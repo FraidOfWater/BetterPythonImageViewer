@@ -540,7 +540,7 @@ class Application(tk.Frame):
             self.statusbar.trace_add("write", lambda *_: self.toggle_statusbar())
 
             self.filter = initial_filter or Application.QUALITY.get(savedata.get("filter", "BICUBIC").lower().capitalize())
-            self.drag_quality = drag_quality or savedata.get("drag_quality").lower().capitalize()
+            self.drag_quality = drag_quality or savedata.get("drag_quality", "BILINEAR").lower().capitalize()
             self.drag_quality = self.drag_quality if self.drag_quality == "No quick filter" else Application.QUALITY.get(self.drag_quality)
             self.anti_aliasing = tk.BooleanVar(value=anti_aliasing or savedata.get("anti_aliasing", True))
             self.anti_aliasing.trace_add("write", lambda *_: (self._zoom_cache.clear(), self._imagetk_cache.clear(), self.draw_image(self.pil_image)))
@@ -1110,8 +1110,6 @@ class Application(tk.Frame):
                 vlc_player.video_frame.config(width=w, height=h - 35)  # leave space for controls
                 vlc_player.controls_frame.config(width=w)        
     
-        # Move the instructions text to the new center
-        # We find it using the "sorter" tag
         w, h = event.width, event.height
 
     def window_close(self, e=None):
