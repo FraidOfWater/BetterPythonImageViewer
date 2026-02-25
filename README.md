@@ -18,16 +18,8 @@ Without antialiasing, use Nearest as filter.
 requires:
 psutil
 pillow
-natsort
 send2trash
-ultralytics
-torch
-torchvision
-scikit-image
 numpy
-imageio
-pymediainfo
-av
 pyvips
 python-vlc
 
