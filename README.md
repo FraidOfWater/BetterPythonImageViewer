@@ -22,6 +22,7 @@ send2trash
 numpy
 pyvips
 python-vlc
+natsort
 
 manual:
 vlc (either you need the plugins folder and libvlc.dll, libvlccore.dll) or you can just install the 64-bit version via installer.
